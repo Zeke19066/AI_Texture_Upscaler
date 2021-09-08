@@ -1,8 +1,6 @@
 import cv2
 import numpy as np
 import os
-import multiprocessing
-from decorators import function_timer
 import shutil
 import os
 
@@ -10,21 +8,6 @@ import NN_Process
 
 #note! Images should be even# length & width for math to work.
 #for textures, you need powers of 2. that means all resolution increases must be 2x,4x,8x,16x,32x, etc
-r"""
-Folders to Avoid
-    water
-    lod
-    ps3, ps3o, xbox, french, german, italian, spanish
-    nv_playingcards
-Files to avoid:
-    theres other effects, will need to reconcile manually.
-    nvl38reflect_e.dds - X:\GOG\Fallout New Vegas\Data\textures\effects\nv
-    terrainnoise
-problem_images:
-    Mentats
-    kings outfit
-    bossscribe outfit
-"""
 
 class NN_Resize():
     def __init__(self):
@@ -37,13 +20,10 @@ class NN_Resize():
         self.forbidden_folders = ["water", "normals", "ps3", "ps3o", "xbox", "french", "german", "italian", "spanish", "nv_playingcards"]
         #self.forbidden_folders = []
         self.forbidden_regex = "_n.png" #let's not process negatives.
-        
-    #@function_timer
+
+    #Method 1 will not subdivide the image before processing(for smaller images; faster)
     def AI_resize_1(self, input_img, model="", mask_bool=True):
-        r"""
-        We take a big picture, and chop it down to be processed by a NN in segments.
-        Then we rearrange the image from its parts. 
-        """
+
         self.model=model
         dir_3 = r"X:\Projects\Super_Rez\NN_Models"
         os.chdir(dir_3)
@@ -105,17 +85,16 @@ class NN_Resize():
             b_channel, g_channel, r_channel = cv2.split(final_image)
             final_image = cv2.merge((b_channel, g_channel, r_channel, alpha_mask))
         return final_image
-    #@function_timer
+    
+    #Method 2 will subdivide the imput image; for CUDA Memory efficiency (OOM)
     def AI_resize_2(self, input_img, model="", factor=4, mask_bool=True):
-        r"""
-        We take a big picture, and chop it down to be processed by a NN in segments.
-        Then we rearrange the image from its parts. 
-        """
         self.model=model
         dir_3 = r"X:\Projects\Super_Rez\NN_Models"
         os.chdir(dir_3)
-        if input_img.shape[2] < 4: #we have less than 4 channels
+
+        if input_img.shape[2] < 4: #we have less than 4 channels (no transparency)
             mask_bool=False
+
         if model == "EDSR_x2":
             sr=cv2.dnn_superres.DnnSuperResImpl_create()
             model_path = "EDSR_x2.pb"
@@ -167,6 +146,12 @@ class NN_Resize():
 
         input_img = cv2.cvtColor(input_img, cv2.COLOR_BGRA2BGR) #we've made our alpha mask; NN can't handle transparency.
 
+        r"""
+        Image Divider & Combiner functions use a strip to correct for errors in borders between subdivisions
+        
+        """
+
+
         def image_divider(img):
             x_val, y_val = img.shape[1], img.shape[0]
             x_unit, y_unit = round(x_val/2), round(y_val/2)
@@ -175,7 +160,7 @@ class NN_Resize():
             img_c, img_d = img[y_unit:y_unit*2, 0:x_unit], img[y_unit:y_unit*2, x_unit:x_unit*2]
             bar_v, bar_h = img[:,(x_unit-x_subunit):(x_unit+x_subunit)], img[(y_unit-y_subunit):(y_unit+y_subunit),:]
             return [img_a, img_b, img_c, img_d, bar_v, bar_h]
-        
+    
         def image_combiner(img_group):
             row_1 = np.concatenate((img_group[0], img_group[1]), axis=1)
             row_2 = np.concatenate((img_group[2], img_group[3]), axis=1)
@@ -202,6 +187,7 @@ class NN_Resize():
             final_image = image_combiner(img_group)       
             return final_image
 
+        #"factor" determines the number of subdivisions
         if factor == 4:
             final_image = protocol(input_img)
 
@@ -226,7 +212,7 @@ class NN_Resize():
             final_image = image_combiner(img_group)
 
         else:
-            print("Imminent Crash! Factors are powers of 2; e.g. 4, 16, 32, etc")
+            print("Imminent Crash! Factors must be powers of 2; e.g. 4, 16, 32, etc")
 
         if mask_bool:
             b_channel, g_channel, r_channel = cv2.split(final_image)
@@ -273,29 +259,23 @@ class NN_Resize():
         return img
 
     def brightness_contrast(self, img, contrast=1, brightness=0):
-
         alpha = contrast # Contrast control (1.0-3.0)
         beta = brightness # Brightness control (0-100)
-        adjusted = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
-        return adjusted
-        #cv2.waitKey()
+        img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+        return img
 
     def transparency(self, input_img, factor, tile_bool=True):
         r"""
-        How transparency works:
-        We take the source png, and copy its alpha channel into a dummy array that we enlarge(dumb)
-        to the same size as the NN image. Then we apply the alpha mask to the output of the NN before we save.
-        
+        We take the source png, and copy its alpha channel into a dummy array that we enlarge through Same NN as color channels,
+        Then we apply the output alpha mask to the output color channels before we save.
         """
-        #img = cv2.cvtColor(input_img, cv2.COLOR_BGR2BGRA) # Convert to RGB with alpha channel
         alhpa_mask = np.ones((input_img.shape[0], input_img.shape[1]), dtype=input_img.dtype)
         for index, value in enumerate(input_img):
             for subindex, subvalue in enumerate(value):
                 alhpa_mask[index][subindex] = subvalue[3]
 
-        #alhpa_mask = self.manual_resize(alhpa_mask, x_val*size_multiple, y_val*size_multiple)
 
-        #clone the alpha to 3 inputs needed for NN(3channel), then split the result to just alpha again.
+        #clone the alpha to 3 inputs needed for NN(3channel BGR), then split the result to just alpha again.
         complex_alpha = cv2.merge((alhpa_mask, alhpa_mask, alhpa_mask))
         if factor != 4 and factor != None:
             print(f"Alpha Mask ", end="")
@@ -308,6 +288,7 @@ class NN_Resize():
         alhpa_mask, m1, m2 = cv2.split(complex_alpha)
         return alhpa_mask
 
+    #The main switchboard function.
     def file_protocol(self, img):
         
         x_val, y_val = img.shape[1], img.shape[0]
@@ -315,30 +296,19 @@ class NN_Resize():
         #multiple_x, multiple_y = round(x_val*maximum_multiple), round(y_val*maximum_multiple)
         #img = resize.brightness_contrast(img, contrast=1.15)
 
-        #Pass 1
+
         img = self.kernel_sharpen(img, level=1.8)
         model = "RealESRGAN_x4"
-        if x_val <= 8 or y_val <= 8: #Too small
-            pass
-            #print(f"****************Too Tiny****************")
-            #print(f"Skipped; under-sized: {file_name}, {x_val}x, {y_val}y; {source_dir}")
-        
-        elif x_val < 128 or y_val < 128:
-            #print(f"Just a lil too small, better use basic NN: {file_name}, {x_val}x, {y_val}y; {source_dir}")
-            img = self.AI_resize_1(img, model="LapSRN_x8")
+        if x_val <= 128 or y_val <= 128: #Too small
+            print("Too Small")
 
-        elif x_val >= 4096 or y_val >= 4096: #Mega size
-            #print(f"****************ENORMO COMIN THROUGH****************")
-            #print(f"Huge Boy, 32x'er: {file_name}, {x_val}x, {y_val}y; {source_dir}")
+        elif x_val >= 4096 or y_val >= 4096:
             img = self.AI_resize_2(img, model=model, factor=32)
-        
-        elif x_val >= 2048 or y_val >= 2048: #bigger than normal
-            #print(f"We got a biggun, 16x I reckon: {file_name}, {x_val}x, {y_val}y; {source_dir}")
+        elif x_val >= 2048 or y_val >= 2048:
             img = self.AI_resize_2(img, model=model, factor=16)
-        
-        elif x_val >= 1024 or y_val >= 1024: #too big for single pass, 4x needed.
+        elif x_val >= 1024 or y_val >= 1024:
             img = self.AI_resize_2(img, model=model, factor=4)
-        
+
         else:#normal size
             img = self.AI_resize_1(img, model=model)
 
@@ -407,6 +377,7 @@ class NN_Resize():
                     self.avoid_list.append(file_name)
 
 def main(mode):
+    #Test mode is for singular images.
     if mode == "test":
         resize = NN_Resize()
         source_dir = r"X:\Projects\Super_Rez\Fallout NV\Source\Samples"
@@ -417,60 +388,38 @@ def main(mode):
         os.chdir(source_dir)
         img = cv2.imread(file_name+".png", cv2.IMREAD_UNCHANGED)
         x_val, y_val = img.shape[1], img.shape[0]
-        maximum_multiple = np.sqrt(302500/(x_val*y_val)) #NN size limit 302,500px; n = srt(302,500/(x*y))
-        multiple_x, multiple_y = round(x_val*maximum_multiple), round(y_val*maximum_multiple)
 
-        #img = resize.kernel_sharpen(img, level=3)
-        #img = resize.brightness_contrast(img, contrast=3, brightness=-10)
         #note:factor is how many many times we subdivide, for large images.
         model = "RealESRGAN_x4"
-        
-        img = resize.manual_resize(img, x_val*2, y_val*2)
-        img = resize.kernel_sharpen(img, level=3)
-        #img = resize.manual_resize(img, x_val, y_val)
-        x_val, y_val = x_val*2, y_val*2
 
-        if x_val <= 8 or y_val <= 8: #Too small
-            print(f"****************Too Tiny****************")
+        if x_val <= 128 or y_val <= 128: #Too small
             print(f"Skipped; under-sized: {file_name}, {x_val}x, {y_val}y; {source_dir}")
         
-        elif x_val < 128 or y_val < 128:
-            print(f"Just a lil too small, better use basic NN: {file_name}, {x_val}x, {y_val}y; {source_dir}")
-            img = resize.AI_resize_1(img, model="LapSRN_x8")
-
         elif x_val >= 4096 or y_val >= 4096: #Mega size
-            print(f"****************ENORMO COMIN THROUGH****************")
-            print(f"Huge Boy, 32x'er: {file_name}, {x_val}x, {y_val}y; {source_dir}")
+            print(f"Factor 32x: {file_name}, {x_val}x, {y_val}y; {source_dir}")
             img = resize.AI_resize_2(img, model=model, factor=32)
         
         elif x_val >= 2048 or y_val >= 2048: #bigger than normal
-            print(f"We got a biggun, 16x I reckon: {file_name}, {x_val}x, {y_val}y; {source_dir}")
+            print(f"Factor 16x: {file_name}, {x_val}x, {y_val}y; {source_dir}")
             img = resize.AI_resize_2(img, model=model, factor=16)
         
         elif x_val >= 1024 or y_val >= 1024: #too big for single pass, 4x needed.
+            print(f"Factor 4x: {file_name}, {x_val}x, {y_val}y; {source_dir}")
             img = resize.AI_resize_2(img, model=model, factor=4)
         
-        else:#normal size
+        else:
+            print(f"Factor Single Pass: {file_name}, {x_val}x, {y_val}y; {source_dir}")
             img = resize.AI_resize_1(img, model=model)
-
-        #img = resize.brightness_contrast(img, contrast=.8, brightness=0)
-        #img = resize.kernel_sharpen(img, level=3)
-        #img = cv2.GaussianBlur(img,(3,3),0)
-        #img = cv2.blur(img,(3,3))
-
 
         if x_val>=1000 and y_val>=1000: #big image
             img = resize.manual_resize(img, x_val*2, y_val*2)
         elif x_val<1000 and y_val<1000: #lil image
             img = resize.manual_resize(img, x_val*4, y_val*4)
 
-        #img = resize.brightness_contrast(img, contrast=1.15, brightness=-5)
-        #img = resize.kernel_sharpen(img, level=1.8)
-        #img = cv2.GaussianBlur(img,(3,3),0)
-        
         os.chdir(output_dir)
         cv2.imwrite(file_name+"_result.png", img)
 
+    #Crawler mode will initialize a directory/file crawler that is capable of copying dir structure.
     elif mode == "crawler":
         resize = NN_Resize()
         resize.parent_source_dir = r"X:\Projects\Super_Rez\Fallout NV\Source\DLCs"
@@ -478,7 +427,6 @@ def main(mode):
         source_dir = resize.parent_source_dir
 
         resize.crawler(source_dir, load_extension=".png", save_extension=".png")
-        #quarentine_dir = r"X:\Projects\Super_Rez\Fallout NV\Source\Quarentine"
 
 if __name__ == "__main__":
     main(mode="test")
